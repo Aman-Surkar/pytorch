@@ -627,7 +627,6 @@ class NNModuleVariable(VariableTracker):
             if isinstance(args[0], SliceVariable):
                 # Build a TupleVariable of NNModules
                 result = []
-                submods = []
 
                 # Turn the slice into the list of integers
                 keys = list(range(len(module)))[args[0].as_python_constant()]
@@ -641,9 +640,8 @@ class NNModuleVariable(VariableTracker):
                             source=src,
                         )
                     )
-                    submods.append(submod)
 
-                new_module = torch.nn.Sequential(*submods)
+                new_module = module[args[0].as_python_constant()]
                 new_module_variable = tx.output.register_attr_or_module(
                     new_module,
                     f"{self}.__getitem__(slice)",
@@ -657,8 +655,10 @@ class NNModuleVariable(VariableTracker):
 
             if isinstance(args[0], SymNodeVariable):
                 key = args[0].evaluate_expr(tx.output)
-            else:
+            elif args[0].is_python_constant():
                 key = args[0].as_python_constant()
+            else:
+                unimplemented(f"getitem on NNModuleVariable with key {args[0]}")
 
             submod = module[key]
             return tx.output.register_attr_or_module(
@@ -738,7 +738,7 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
     @functools.lru_cache(None)
     def _nn_module_method_ids():
         # Allow __setattr__ to fall through to base class handler
-        supported = {torch.nn.Module.__setattr__}
+        supported = {torch.nn.Module.__setattr__, torch.nn.Module.__init__}
         return {
             id(x.__code__)
             for x in torch.nn.Module.__dict__.values()
@@ -746,8 +746,6 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
         }
 
     def unpack_var_sequence(self, tx):
-        from .builder import VariableBuilder
-
         try:
             fn = inspect.getattr_static(self.value_type, "__iter__")
         except AttributeError as e:
@@ -758,11 +756,16 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
             torch.nn.ParameterList.__iter__,
             torch.nn.Sequential.__iter__,
         ):
-            assert self.source
-            return [
-                VariableBuilder(tx, source=GetItemSource(self.source, idx))(item)
-                for idx, item in enumerate(self.value)
-            ]
+            # The program can mutate the nn module object but the saved `value`
+            # will not reflect the mutations. So, trace through the `__iter__`
+            # function to reflect any tracked mutations.
+            return tx.inline_user_function_return(
+                variables.UserFunctionVariable(fn),
+                [
+                    self,
+                ],
+                {},
+            ).unpack_var_sequence(tx)
 
         return super().unpack_var_sequence(tx)
 
@@ -888,6 +891,15 @@ class UnspecializedNNModuleVariable(UserDefinedObjectVariable):
                 ):
                     # Handle submodules
                     self.is_state_mutated = True
+
+            if name == "__setattr__" and isinstance(value, variables.DeletedVariable):
+                # Trace through __delattr__ to track mutations on the module
+                # members like `_modules``.
+                return tx.inline_user_function_return(
+                    variables.UserFunctionVariable(torch.nn.Module.__delattr__),
+                    [self, args[0]],
+                    kwargs,
+                )
 
         return super().call_method(tx, name, args, kwargs)
 
